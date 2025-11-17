@@ -1,5 +1,12 @@
 import numpy as np
 import pandas as pd
+import warnings
+
+# Try to import CuPy for GPU acceleration. If unavailable, fall back to NumPy.
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 import time
 import os
 from typing import List, Tuple, Dict
@@ -24,6 +31,24 @@ class CrowdManagementEnv:
         # Pre-calculate distances from each attendee to each gate
         self.distance_matrix = self._get_distance_matrix()
 
+        # GPU auto-detect: enable accelerated path when CuPy is available and a GPU device exists
+        self.gpu_available = False
+        if cp is not None:
+            try:
+                # This will raise if no CUDA device is present
+                _ = cp.cuda.runtime.getDeviceCount()
+                if cp.cuda.runtime.getDeviceCount() > 0:
+                    self.gpu_available = True
+            except Exception:
+                self.gpu_available = False
+
+        if self.gpu_available:
+            # Move distance matrix to GPU as needed
+            try:
+                self._distance_matrix_gpu = cp.asarray(self.distance_matrix)
+            except Exception:
+                self._distance_matrix_gpu = None
+
         # Maximum cumulative capacity over the main arrival window, used for safety checks
         self.max_cumulative_capacity = self.gate_data['Capacity_PPM'].sum() * 1.5
 
@@ -45,10 +70,16 @@ class CrowdManagementEnv:
         self.attendee_data['Assignment_Gate'] = solution.astype(int)
 
         # 1. Calculate Queue Times (Efficiency & Safety)
-        queue_time_total, safety_violation_count = self._calculate_queue_metrics()
+        if self.gpu_available:
+            queue_time_total, safety_violation_count = self._calculate_queue_metrics_fast_gpu(solution.astype(int))
+        else:
+            queue_time_total, safety_violation_count = self._calculate_queue_metrics()
 
         # 2. Calculate Distance (Experience)
-        distance_total = self._calculate_distance_metric(solution.astype(int))
+        if self.gpu_available and getattr(self, '_distance_matrix_gpu', None) is not None:
+            distance_total = self._calculate_distance_metric_gpu(solution.astype(int))
+        else:
+            distance_total = self._calculate_distance_metric(solution.astype(int))
 
         # 3. Apply Multi-Objective Weights
         weighted_efficiency = queue_time_total * QUEUE_TIME_WEIGHT
@@ -127,6 +158,77 @@ class CrowdManagementEnv:
 
         return total_queue_time, safety_violation_count
 
+    def _calculate_queue_metrics_fast_gpu(self, solution: np.ndarray) -> Tuple[float, int]:
+        """
+        Fast, vectorized approximation of queue metrics using GPU (CuPy) when available.
+
+        This implementation computes per-gate per-minute arrival volumes and
+        computes queue lengths as the excess of cumulative arrivals over cumulative
+        processing capacity. Total queue time is approximated as the time-integral
+        (sum over minutes) of the queue length. Safety violations are counted when
+        instantaneous queue exceeds 1.5x gate capacity.
+        """
+        if cp is None:
+            # Fallback to CPU exact version if CuPy not available
+            warnings.warn("CuPy not available; falling back to CPU queue metric.")
+            return self._calculate_queue_metrics()
+
+        # Prepare arrays on GPU
+        attendee = self.attendee_data
+        arrival_times = cp.asarray(attendee['Arrival_Time_Min'].to_numpy())
+        group_sizes = cp.asarray(attendee['Group_Size'].to_numpy())
+        sol_gpu = cp.asarray(solution.astype(int))
+
+        min_time = int(self.attendee_data['Arrival_Time_Min'].min())
+        max_time = int(self.attendee_data['Arrival_Time_Min'].max())
+        T = max_time - min_time + 11  # small buffer
+
+        # Build per-gate arrival volume matrix: shape (num_gates, T)
+        arrivals = cp.zeros((self.num_gates, T), dtype=cp.float32)
+        times_idx = (arrival_times - min_time).astype(cp.int32)
+
+        for g in range(self.num_gates):
+            mask = (sol_gpu == int(g))
+            if mask.sum() == 0:
+                continue
+            times_for_gate = times_idx[mask]
+            weights_for_gate = group_sizes[mask]
+            # Use bincount to aggregate arrivals per minute
+            b = cp.bincount(times_for_gate, weights=weights_for_gate, minlength=T)
+            arrivals[g, :b.shape[0]] = b
+
+        # Compute cumulative arrivals per gate over time
+        cum_arrivals = cp.cumsum(arrivals, axis=1)
+
+        # Cumulative processing capacity per minute for each gate
+        capacities = cp.asarray(self.gate_data['Capacity_PPM'].to_numpy(dtype=float)).astype(cp.float32)
+        # processed_by_min[t] = capacity * (t+1)
+        time_steps = cp.arange(1, T + 1, dtype=cp.float32)
+        cum_capacity = capacities[:, None] * time_steps[None, :]
+
+        # Queue length at time t = max(0, cum_arrivals - cum_capacity)
+        queue_matrix = cum_arrivals - cum_capacity
+        queue_matrix = cp.maximum(queue_matrix, 0.0)
+
+        # Approximate total queue time as sum over time of queue lengths
+        total_queue_time = float(cp.sum(queue_matrix).get())
+
+        # Safety violations: count minutes where queue > 1.5 * capacity
+        safety_thresholds = (capacities * 1.5)[:, None]
+        safety_violations = int(cp.sum(queue_matrix > safety_thresholds).get())
+
+        return total_queue_time, safety_violations
+
+    def _calculate_distance_metric_gpu(self, solution: np.ndarray) -> float:
+        """GPU-accelerated distance calculation using preloaded distance matrix on GPU."""
+        if cp is None or getattr(self, '_distance_matrix_gpu', None) is None:
+            return self._calculate_distance_metric(solution)
+
+        sol_gpu = cp.asarray(solution.astype(int))
+        idx = cp.arange(self.num_attendees, dtype=cp.int32)
+        distances = self._distance_matrix_gpu[idx, sol_gpu]
+        return float(cp.sum(distances).get())
+
     def _calculate_distance_metric(self, solution: np.ndarray) -> float:
         """Calculates the total distance traveled by all attendees."""
         
@@ -147,6 +249,46 @@ class CrowdManagementEnv:
     def get_distance_matrix(self) -> np.ndarray:
         """Exposes the pre-calculated distance matrix."""
         return self.distance_matrix
+
+    def calculate_batch_fitness(self, solutions: np.ndarray) -> np.ndarray:
+        """
+        Calculate fitness for a batch of solutions.
+
+        `solutions` should be shape (batch_size, num_attendees).
+        Returns a 1D numpy array of fitness values (length batch_size).
+        """
+        solutions = np.asarray(solutions, dtype=int)
+        batch_size = solutions.shape[0]
+        fitnesses = np.empty(batch_size, dtype=float)
+
+        if self.gpu_available and getattr(self, '_distance_matrix_gpu', None) is not None:
+            # Compute distances in batch on GPU
+            sol_gpu = cp.asarray(solutions)
+            rows = cp.arange(self.num_attendees, dtype=cp.int32)[None, :]
+            rows = cp.repeat(rows, batch_size, axis=0)
+            dists = self._distance_matrix_gpu[rows, sol_gpu]
+            dist_sums = cp.sum(dists, axis=1)
+            dist_sums_host = dist_sums.get()
+        else:
+            # CPU distance sums per solution
+            dist_sums_host = np.array([self._calculate_distance_metric(solutions[i]) for i in range(batch_size)])
+
+        # For queue metrics we reuse the (fast) GPU per-solution method when available.
+        for i in range(batch_size):
+            sol = solutions[i].astype(int)
+            if self.gpu_available:
+                q_time, safety = self._calculate_queue_metrics_fast_gpu(sol)
+            else:
+                # Assign to dataframe then call exact method
+                self.attendee_data['Assignment_Gate'] = sol
+                q_time, safety = self._calculate_queue_metrics()
+
+            weighted_efficiency = q_time * QUEUE_TIME_WEIGHT
+            weighted_experience = dist_sums_host[i] * DISTANCE_WEIGHT
+            safety_penalty = safety * SAFETY_VIOLATION_PENALTY
+            fitnesses[i] = weighted_efficiency + weighted_experience + safety_penalty
+
+        return fitnesses
 
 
 # Example helper function to load data (used by testing framework)

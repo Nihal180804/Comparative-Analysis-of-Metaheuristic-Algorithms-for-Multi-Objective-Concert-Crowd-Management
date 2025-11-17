@@ -83,8 +83,8 @@ def run_algorithms(env: CrowdManagementEnv, scenario_name: str, results_dir: str
         "FCFS": {"run": True},
         "GA":   {"run": True, "pop_size": 40, "max_generations": 60, "mutation_rate": 0.05},
         "PSO":  {"run": True, "num_particles": 25, "max_iterations": 60, "w": 0.8, "c1": 2.0, "c2": 2.0},
-        "SA":   {"run": True, "max_iterations": 600, "initial_temp": 60.0, "cooling_rate": 0.96},
-        "ACO":  {"run": True, "num_ants": 10, "max_iterations": 40, "rho": 0.1, "alpha": 1.0, "beta": 5.0},
+        "SA":   {"run": True, "max_iterations": 1200, "initial_temp": 1000.0, "cooling_rate": 0.995},
+        "ACO":  {"run": True, "num_ants": 10, "max_iterations": 50, "rho": 0.3, "alpha": 0.7, "beta": 2.0},
     }
 
     per_algo_results = {}

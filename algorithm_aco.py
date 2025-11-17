@@ -5,7 +5,7 @@ from crowd_management_env import CrowdManagementEnv
 # In this implementation, the "graph" is conceptual: Att_i -> Gate_j
 # The "edges" are the (i, j) combinations, and pheromones are on (attendee, gate) pairings.
 
-def solve_aco(env: CrowdManagementEnv, num_ants=10, max_iterations=50, rho=0.1, alpha=1.0, beta=5.0) -> np.ndarray:
+def solve_aco(env: CrowdManagementEnv, num_ants=10, max_iterations=50, rho=0.3, alpha=0.7, beta=2.0, Q=0.5) -> np.ndarray:
     """
     Implements the Ant Colony Optimization (ACO) algorithm for gate assignment.
     
@@ -49,27 +49,46 @@ def solve_aco(env: CrowdManagementEnv, num_ants=10, max_iterations=50, rho=0.1, 
                 
                 # Combined probability numerator
                 prob_numerator = pheromone_contrib * heuristic_contrib
-                
-                # Total probability denominator
-                probabilities = prob_numerator / np.sum(prob_numerator)
+
+                # Total probability denominator (add small epsilon to avoid divide-by-zero)
+                denom = np.sum(prob_numerator)
+                if denom <= 0:
+                    probabilities = np.ones(num_gates) / num_gates
+                else:
+                    probabilities = prob_numerator / denom
                 
                 # Select a gate based on probability
                 assigned_gate = np.random.choice(num_gates, p=probabilities)
                 ant_solution[attendee_idx] = assigned_gate
                 
-            # Evaluate the completed solution
-            fitness = env.calculate_solution_fitness(ant_solution)
-            
+            # Store the completed solution for batch evaluation
             all_ant_solutions.append(ant_solution)
-            all_ant_fitnesses.append(fitness)
-            
-            # Update global best solution
+
+        # Evaluate all ants in batch (GPU-accelerated if available)
+        try:
+            batch = np.vstack(all_ant_solutions)
+            batch_fitnesses = env.calculate_batch_fitness(batch)
+        except Exception:
+            # Fallback to individual evaluation if batch fails
+            batch_fitnesses = []
+            for sol in all_ant_solutions:
+                f = env.calculate_solution_fitness(sol)
+                batch_fitnesses.append(f)
+            batch_fitnesses = np.array(batch_fitnesses)
+
+        all_ant_fitnesses = list(batch_fitnesses)
+
+        # Update global best solution from this batch
+        for idx, sol in enumerate(all_ant_solutions):
+            fitness = all_ant_fitnesses[idx]
             if fitness < best_fitness:
                 best_fitness = fitness
-                best_solution = ant_solution.copy()
+                best_solution = sol.copy()
 
         # 3. Pheromone Evaporation
         pheromones *= (1 - rho)
+        # Keep pheromones within reasonable bounds to avoid runaway convergence
+        pheromones = np.clip(pheromones, 1e-6, 10.0)
         
         # 4. Pheromone Reinforcement (Deposit)
         # We reinforce the paths used by the best ants
@@ -81,12 +100,16 @@ def solve_aco(env: CrowdManagementEnv, num_ants=10, max_iterations=50, rho=0.1, 
         
         # Pheromone deposit amount (proportional to solution quality - inverse of fitness)
         # Add a small epsilon to prevent division by zero if fitness is unexpectedly low
-        deposit_amount = 1.0 / (current_best_fitness + 1e-6) 
+        # Scale deposit by Q (smaller Q reduces reinforcement strength)
+        deposit_amount = Q / (current_best_fitness + 1e-6) 
         
         # Reinforce the edges (attendee_i -> gate_j) used by the best ant
         for i in range(num_attendees):
             assigned_gate = current_best_solution[i]
             pheromones[i, assigned_gate] += deposit_amount
+
+        # Clip again after deposits
+        pheromones = np.clip(pheromones, 1e-6, 10.0)
             
         # Optional: Normalize pheromones to prevent overflow (not strictly necessary but good practice)
         # pheromones = np.clip(pheromones, 1e-9, 100.0)
