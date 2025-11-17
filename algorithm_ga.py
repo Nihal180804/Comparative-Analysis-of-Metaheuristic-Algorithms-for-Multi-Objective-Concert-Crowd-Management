@@ -9,23 +9,26 @@ def solve_ga(env: CrowdManagementEnv, pop_size=50, max_generations=100, mutation
     num_attendees = env.num_attendees
     num_gates = env.num_gates
     
-    # 1. Initialize Population
-    population = [env.get_random_solution() for _ in range(pop_size)]
-    
+    # 1. Initialize Population (array shape: pop_size x num_attendees)
+    population = np.vstack([env.get_random_solution() for _ in range(pop_size)])
+
     for generation in range(max_generations):
-        # 2. Evaluate Fitness
-        fitnesses = np.array([env.calculate_solution_fitness(sol) for sol in population])
-        
+        # 2. Evaluate Fitness (batch if available)
+        try:
+            fitnesses = env.calculate_batch_fitness(population)
+        except Exception:
+            fitnesses = np.array([env.calculate_solution_fitness(sol) for sol in population])
+
         best_index = np.argmin(fitnesses)
-        best_solution = population[best_index]
+        best_solution = population[best_index].copy()
         best_fitness = fitnesses[best_index]
         
         # 3. Selection (Elitism and Tournament)
         new_population = [best_solution.copy()]  # Elitism: keep the best solution
 
-        # Tournament Selection
+        # Tournament Selection (vector-friendly)
         for _ in range(pop_size - 1):
-            candidates = np.random.randint(0, pop_size, 3) # Pick 3 random parents
+            candidates = np.random.randint(0, pop_size, 3)  # Pick 3 random parents
             winner_index = candidates[np.argmin(fitnesses[candidates])]
             new_population.append(population[winner_index].copy())
 
@@ -34,7 +37,7 @@ def solve_ga(env: CrowdManagementEnv, pop_size=50, max_generations=100, mutation
         for i in range(0, pop_size, 2):
             parent1 = new_population[i]
             parent2 = new_population[i+1] if i + 1 < pop_size else new_population[0]
-            
+
             # Crossover (Two-point)
             crossover_point1 = np.random.randint(1, num_attendees - 1)
             crossover_point2 = np.random.randint(crossover_point1, num_attendees)
@@ -50,14 +53,14 @@ def solve_ga(env: CrowdManagementEnv, pop_size=50, max_generations=100, mutation
             if np.random.rand() < mutation_rate:
                 mutate_index = np.random.randint(0, num_attendees)
                 child2[mutate_index] = np.random.randint(0, num_gates)
-                
+
             offspring.extend([child1, child2])
 
         # Ensure population size remains constant (handle odd population size)
-        population = offspring[:pop_size]
+        population = np.vstack(offspring[:pop_size])
 
         # Early stopping for visual feedback (optional)
-        if generation % (max_generations // 10) == 0:
+        if generation % max(1, (max_generations // 10)) == 0:
             print(f"  GA Gen {generation}/{max_generations}: Best Fitness = {best_fitness:.2f}")
 
     return best_solution
